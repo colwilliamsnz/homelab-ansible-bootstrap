@@ -14,7 +14,7 @@ controller_pubkey: "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAXfg6TuKUUg2xoXWjl3bAel
 
 # Optional: restrict the key to the controller's source IP(s), comma separated.
 # Must fall inside ssh_allowed_cidrs. Leave empty for no restriction.
-controller_from: "10.10.2.31"
+controller_from: "10.10.20.42"
 
 # authorized_keys options prepended to the controller key, comma separated.
 # "restrict" disables port/agent/X11 forwarding and pty allocation. Ansible
@@ -55,3 +55,4 @@ base_packages:
 ssh_port: 22
 ssh_allowed_cidrs:
   - 10.10.2.0/24
+  - 10.10.40.0/24

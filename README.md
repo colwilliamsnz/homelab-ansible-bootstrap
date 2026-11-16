@@ -4,8 +4,9 @@ Wattle Labs ansible-pull bootstrap. It gets a new host to the point where the An
 (`inf-cfgm-01`) can connect and manage it, and keeps it there. **Access only:** everything else is configured
 by the controller repo, [host-inf-cfgm-01](https://github.com/colwilliamsnz/host-inf-cfgm-01).
 
-Run it once by hand on a new host. After that, an hourly systemd timer (installed by the play) re-applies it
-whenever this repo changes, so a controller IP or key change is just a commit here, not a visit to every host.
+Run it once by hand on a new host. After that, an hourly systemd timer (installed by the play) pulls this repo and
+re-applies it every hour. A controller IP or key change is just a commit here, not a visit to every host, and
+changes made on a host by hand are corrected within the hour.
 
 Supported targets: Debian and Ubuntu, including Proxmox VE (access only, no firewall). The play asserts this and
 fails on anything else.
@@ -17,7 +18,7 @@ fails on anything else.
 2. **Detects Proxmox VE** (`/etc/pve`). PVE nodes get access only: no `ufw` package and no firewall rules.
    See [Proxmox VE nodes](#proxmox-ve-nodes).
 3. **Installs only what access and the hourly pull need** (`bootstrap_packages`): `openssh-server`, `sudo`,
-   `python3`, `python3-apt`, `git`, `ansible-core`, `ca-certificates`, plus `ufw` on non-PVE hosts. Installed
+   `python3`, `python3-apt`, `git`, `ansible-core`, `ca-certificates`, `nano`, plus `ufw` on non-PVE hosts. Installed
    if missing, never upgraded.
 4. **Creates the `svc_ansible` service account** with a locked password, and writes the controller's public
    key to its `authorized_keys`. The file is authoritative: any other key is removed.
@@ -69,9 +70,9 @@ All variables live in `vars/main.yml`. Review them before the first run. In part
 | `ssh_service_name` | SSH service unit name (`ssh` on Debian/Ubuntu) |
 | `ssh_port`, `ssh_allowed_cidrs` | Port and networks for the UFW SSH rules. Authoritative: other allow/limit rules for `ssh_port` are removed |
 | `bootstrap_packages` | Packages access and the pull need (plus `ufw` on non-PVE hosts) |
-| `bootstrap_schedule_enabled` | Hourly timer on (`true`) or off (`false`, the default) |
+| `bootstrap_schedule_enabled` | Hourly timer on (`true`, the current setting) or off (`false`, the [kill switch](#hourly-pull)) |
 | `bootstrap_schedule_oncalendar`, `bootstrap_schedule_random_delay` | When the timer fires (`hourly`, plus up to `15min`) |
-| `bootstrap_schedule_only_if_changed` | Only re-apply when there's a new commit (default `true`) |
+| `bootstrap_schedule_only_if_changed` | `false` (current): re-apply every hour. `true`: only when there's a new commit |
 | `bootstrap_repo_url`, `bootstrap_repo_branch`, `bootstrap_checkout_dir` | What the timer pulls, and where it keeps the checkout |
 
 `restrict` disables port forwarding, agent forwarding, X11 forwarding and pty allocation for the key. Ansible
@@ -92,8 +93,9 @@ sudo LC_ALL=C.UTF-8 ansible-pull \
 
 - `LC_ALL=C.UTF-8`: ansible-core refuses to run without a UTF-8 locale, and a fresh minimal image may not have
   one set. `C.UTF-8` is built into Debian and Ubuntu. The timer sets the same thing for its runs.
-- `-d /var/lib/ansible-pull/bootstrap`: the same checkout the timer uses, so the timer's first run sees no new
-  commit and doesn't run again straight away.
+- `-d /var/lib/ansible-pull/bootstrap`: the same checkout the timer uses, so the timer updates it rather than
+  cloning a second copy.
+- With `bootstrap_schedule_enabled: true` (the current setting), this run also starts the hourly timer.
 - HTTPS verifies GitHub through the system CA bundle (`ca-certificates`), so no `--accept-host-key` or
   `known_hosts` entry is needed.
 - The play is safe to re-run. A re-run reports no changes if nothing has drifted.
@@ -136,23 +138,29 @@ The play always installs two systemd units:
 
 - **`ansible-bootstrap-pull.service`:** a oneshot, so runs never overlap. It runs:
   ```
-  ansible-pull -U <bootstrap_repo_url> -C main -d /var/lib/ansible-pull/bootstrap -i localhost, --clean --only-if-changed local.yml
+  ansible-pull -U <bootstrap_repo_url> -C main -d /var/lib/ansible-pull/bootstrap -i localhost, --clean local.yml
   ```
   with `LC_ALL=C.UTF-8` and `HOME=/root`. `--clean` discards any local edits to the checkout.
 - **`ansible-bootstrap-pull.timer`:** `OnCalendar=hourly`, `RandomizedDelaySec=15min` (so hosts don't all hit
   GitHub at once), and `Persistent=true` (a run missed while the host was off happens at the next boot).
 
-**`--only-if-changed`:** a run only applies the play when there's a new commit. Changes made on the host itself
-(e.g. someone editing `authorized_keys`) aren't corrected until the next commit. To make every host re-apply,
-push any commit: `git commit --allow-empty -m "Re-apply bootstrap"` works. To re-apply on one host straight
-away, run the [first-run command](#first-run-by-hand) again.
+**Every hour, not just on new commits.** With `bootstrap_schedule_only_if_changed: false` (the current setting),
+every run applies the play, whether or not the repo has changed. So changes made on the host itself (e.g. someone
+editing `authorized_keys` or deleting the SSH rule) are put back within the hour. For an access-only play, the cost
+is small. Setting it to `true` adds `--only-if-changed`: runs then only apply the play when there's a new commit.
+To re-apply on one host straight away, run the [first-run command](#first-run-by-hand) again.
 
-**Turning it on (rollout):** set `bootstrap_schedule_enabled: true` and merge, then run the bootstrap by hand
-once on each host. A host whose timer is off never pulls, so it can't pick up the change by itself. Planned
-order: a test host, then LXCs, VMs and Proxmox VE nodes.
+**Until the controller's `base` role stops managing access** (plan step 4 in host-inf-cfgm-01), both repos write
+`authorized_keys` and sudoers. If their values differ, each run of one overwrites the other, now every hour.
+Keep them identical (see [Changing controller access](#changing-controller-access)).
 
-**Kill switch:** set `bootstrap_schedule_enabled: false` and push. That's a new commit, so every host with a
-running timer pulls it and turns its own timer off.
+**Rollout:** the timer is on in this repo (`bootstrap_schedule_enabled: true`). A host only gets it when the
+bootstrap is run by hand there once, which installs and starts the timer. A host that has never run this version
+never pulls, so it can't pick up the timer by itself. Order: the test host (`lab-cfgm-01`), then LXCs, VMs and
+Proxmox VE nodes.
+
+**Kill switch:** set `bootstrap_schedule_enabled: false` and push. On its next hourly run, every host with a running
+timer pulls the change and turns its own timer off.
 
 **Checking a host:**
 
@@ -185,8 +193,9 @@ Do these as an overlap, so the controller never loses access while hosts catch u
 4. Remove the old key from `controller_pubkeys` and merge.
 
 **Until the controller's `base` role stops managing access** (plan step 4 in host-inf-cfgm-01), it still writes
-`authorized_keys` and sudoers from that repo's `inventory/group_vars/all.yml`. Change the same values there in the
-same change, or the two repos undo each other.
+`authorized_keys` and sudoers from that repo's `inventory/group_vars/all.yml` (`base_ansible_from`,
+`base_ansible_pubkeys`). At each step above, change the same value there too and run `--tags base`. Otherwise the
+two repos undo each other every hour. host-inf-cfgm-01's `roles/base/README.md` has the same procedure from that side.
 
 ## Proxmox VE nodes
 

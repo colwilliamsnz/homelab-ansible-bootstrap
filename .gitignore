@@ -1,0 +1,39 @@
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+Icon?
+.DocumentRevisions-V100
+.fseventsd
+.Spotlight-V100
+.TemporaryItems
+.Trashes
+.VolumeIcon.icns
+.com.apple.timemachine.donotpresent
+.AppleDB
+.AppleDesktop
+Network Trash Folder
+Temporary Items
+.apdisk
+
+# Editors
+.vscode/
+.idea/
+*.swp
+*~
+
+# Ansible
+*.retry
+
+# Secrets (this repo is public; nothing secret belongs here)
+.env
+.env.*
+*.env
+.vault_pass*
+vault_pass*
+
+# Claude Code
+CLAUDE.md
+.claude/settings.local.json
+.claude/settings.json

@@ -38,6 +38,7 @@ bootstrap_packages:
   - git
   - ansible-core
   - ca-certificates
+  - nano
 
 # UFW SSH rules (not on PVE). This list is authoritative: any other UFW
 # allow/limit rule for ssh_port is removed. The bootstrap doesn't turn UFW on;
@@ -55,12 +56,12 @@ ssh_allowed_cidrs:
 # the timer off never pulls, so it can't see this change by itself).
 # Kill switch: set false and push; every host with a running timer pulls the
 # commit and turns its own timer off.
-bootstrap_schedule_enabled: false
+bootstrap_schedule_enabled: true
 bootstrap_schedule_oncalendar: hourly
 bootstrap_schedule_random_delay: 15min    # spread hosts out so they don't all hit GitHub at once
 # Run only when there's a new commit. Changes made on the host itself aren't
 # corrected until the next commit.
-bootstrap_schedule_only_if_changed: true
+bootstrap_schedule_only_if_changed: false
 
 bootstrap_repo_url: https://github.com/colwilliamsnz/homelab-ansible-bootstrap.git
 bootstrap_repo_branch: main

@@ -4,14 +4,14 @@ Outstanding work for the bootstrap. Background, decisions and conventions are in
 what's still to do. Tick items off (or delete them) as they're done.
 
 ## Now: branch `access-only-bootstrap` (plan step 2)
-- [ ] Commit and push the branch.
-- [ ] Test on `lab-test-01.wattle.nz`, at its console:
+- [x] Commit and push the branch.
+- [x] Test on `lab-test-01.wattle.nz`, at its console:
   - `sudo LC_ALL=C.UTF-8 ansible-pull -U https://github.com/colwilliamsnz/homelab-ansible-bootstrap.git -C access-only-bootstrap -i localhost, --check`, then without `--check`.
   - Timer installed but off: `systemctl status ansible-bootstrap-pull.timer`. SSH rules present: `sudo ufw show added | grep bootstrap-ssh`.
   - Optional timer test: add `-e bootstrap_schedule_enabled=true -e bootstrap_repo_branch=access-only-bootstrap`, then
     `sudo systemctl start ansible-bootstrap-pull.service` and `journalctl -u ansible-bootstrap-pull`.
   - From the controller: `sudo -u svc_ansible sh -c 'ansible lab-test-01.wattle.nz -m ansible.builtin.ping'`.
-- [ ] Merge into `main` (`--ff-only`), push, delete the branch.
+- [x] Merge into `main` (`--ff-only`), push, delete the branch.
 - [ ] Controller repo follow-ups, in the same session as the merge:
   - `inventory/group_vars/all.yml` header: drop the `system_timezone`, `system_locale` and `base_packages` mappings
     (now the controller's own), and rename `controller_pubkey` → `controller_pubkeys`.

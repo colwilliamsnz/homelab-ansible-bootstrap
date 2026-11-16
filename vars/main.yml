@@ -1,16 +1,15 @@
 ---
 
-# Time and locale
-system_timezone: Pacific/Auckland
-system_locale: en_NZ.UTF-8
-
 # Service account the Ansible controller connects as
 ansible_svc_user: svc_ansible
 ansible_svc_home: "/home/{{ ansible_svc_user }}"
 ansible_svc_shell: /bin/bash
 
-# Controller public key (not a secret, but repo integrity matters: see README)
-controller_pubkey: "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAXfg6TuKUUg2xoXWjl3bAeleXKLffnUs9pYX9buq6FQ Wattle-Ansible"
+# Controller public keys, one full line each (not secret, but repo integrity
+# matters: see README). authorized_keys is authoritative. To rotate: add the new
+# key, wait for every host to pull, switch the controller, then remove the old one.
+controller_pubkeys:
+  - "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAXfg6TuKUUg2xoXWjl3bAeleXKLffnUs9pYX9buq6FQ Wattle-Ansible"
 
 # Optional: restrict the key to the controller's source IP(s), comma separated.
 # Must fall inside ssh_allowed_cidrs. Leave empty for no restriction.
@@ -28,32 +27,41 @@ sudoers_dropin_path: /etc/sudoers.d/99-ansible
 # Service that must be enabled and running ("ssh" on Debian/Ubuntu)
 ssh_service_name: ssh
 
-# Base packages installed on every run (present, not upgraded; patching is the controller's job)
-base_packages:
+# Only what access and the hourly pull depend on (present, never upgraded).
+# Base packages, timezone and locale are set by the controller's base role.
+# ufw is added on non-PVE hosts, for the SSH rules below.
+bootstrap_packages:
   - openssh-server
   - sudo
+  - python3
   - python3-apt
-  - acl
+  - git
+  - ansible-core
   - ca-certificates
-  - gnupg
-  - iputils-ping
-  - bind9-dnsutils
-  - curl
-  - wget
-  - nano
-  - less
-  - man-db
-  - tmux
-  - htop
-  - lsof
-  - rsync
-  - unzip
-  - bash-completion
 
-# UFW: SSH is only reachable from these networks. All other inbound traffic is denied.
-# Any other UFW allow/limit rule for ssh_port is removed, so this list is authoritative.
+# UFW SSH rules (not on PVE). This list is authoritative: any other UFW
+# allow/limit rule for ssh_port is removed. The bootstrap doesn't turn UFW on;
+# the controller's firewall role does.
 ssh_port: 22
 ssh_allowed_cidrs:
   - 10.10.2.0/24
   - 10.10.20.0/24
   - 10.10.40.0/24
+
+# ---------- Hourly pull (systemd timer) ----------
+
+# The service and timer are installed either way; this turns the timer on or off.
+# Rollout: set true, then run the bootstrap by hand once per host (a host with
+# the timer off never pulls, so it can't see this change by itself).
+# Kill switch: set false and push; every host with a running timer pulls the
+# commit and turns its own timer off.
+bootstrap_schedule_enabled: false
+bootstrap_schedule_oncalendar: hourly
+bootstrap_schedule_random_delay: 15min    # spread hosts out so they don't all hit GitHub at once
+# Run only when there's a new commit. Changes made on the host itself aren't
+# corrected until the next commit.
+bootstrap_schedule_only_if_changed: true
+
+bootstrap_repo_url: https://github.com/colwilliamsnz/homelab-ansible-bootstrap.git
+bootstrap_repo_branch: main
+bootstrap_checkout_dir: /var/lib/ansible-pull/bootstrap

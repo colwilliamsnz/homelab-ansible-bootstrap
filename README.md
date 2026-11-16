@@ -1,155 +1,205 @@
 # Ansible Bootstrap
 
-Wattle Labs ansible-pull bootstrap. Applies a minimal base config to a new host so the Ansible controller can manage it with normal playbooks.
+Wattle Labs ansible-pull bootstrap. It gets a new host to the point where the Ansible controller
+(`inf-cfgm-01`) can connect and manage it, and keeps it there. **Access only:** everything else is configured
+by the controller repo, [host-inf-cfgm-01](https://github.com/colwilliamsnz/host-inf-cfgm-01).
 
-Run once per host, by hand. It is not scheduled. After the bootstrap, the controller manages the host.
+Run it once by hand on a new host. After that, an hourly systemd timer (installed by the play) re-applies it
+whenever this repo changes, so a controller IP or key change is just a commit here, not a visit to every host.
 
-Supported targets: Debian and Ubuntu. The play asserts this and fails on anything else.
+Supported targets: Debian and Ubuntu, including Proxmox VE (access only, no firewall). The play asserts this and
+fails on anything else.
 
 ## What it does
 
-- Installs base packages (`base_packages`). Packages are installed if missing, not upgraded (patching is the controller's job). Note that a number of useful utilities are installed over and above what Ansible needs to run.
-- Sets the system timezone (`/etc/localtime`, `/etc/timezone`).
-- Generates and sets the default locale (`/etc/locale.gen`, `/etc/default/locale`).
-- Creates the `svc_ansible` service account with a locked password and writes the controller's public key to its `authorized_keys`. The file is authoritative: any other key is removed.
-- Grants the service account passwordless sudo via a drop-in in `/etc/sudoers.d/`. See [Sudo access](#sudo-access).
-- Enables UFW: deny inbound by default, allow SSH only from `ssh_allowed_cidrs`. See [Firewall behaviour](#firewall-behaviour).
-- Ensures the SSH service is enabled and running.
+1. **Checks first, before any change:** Debian family, at least one well-formed key in `controller_pubkeys`, and (except on PVE)
+   at least one network in `ssh_allowed_cidrs`.
+2. **Detects Proxmox VE** (`/etc/pve`). PVE nodes get access only: no `ufw` package and no firewall rules.
+   See [Proxmox VE nodes](#proxmox-ve-nodes).
+3. **Installs only what access and the hourly pull need** (`bootstrap_packages`): `openssh-server`, `sudo`,
+   `python3`, `python3-apt`, `git`, `ansible-core`, `ca-certificates`, plus `ufw` on non-PVE hosts. Installed
+   if missing, never upgraded.
+4. **Creates the `svc_ansible` service account** with a locked password, and writes the controller's public
+   key to its `authorized_keys`. The file is authoritative: any other key is removed.
+5. **Grants `svc_ansible` passwordless sudo** via a drop-in in `/etc/sudoers.d/`. See [Sudo access](#sudo-access).
+6. **Manages the UFW rules that let SSH in** from `ssh_allowed_cidrs` (not on PVE). It does **not** turn UFW
+   on. See [Firewall behaviour](#firewall-behaviour).
+7. **Makes sure the SSH service is enabled and running.**
+8. **Installs the hourly pull** (`ansible-bootstrap-pull.service` and `.timer`), and turns the timer on or off
+   from `bootstrap_schedule_enabled`. See [Hourly pull](#hourly-pull).
 
 ## Out of scope
 
-Everything else is applied by the controller's playbooks after the bootstrap, including:
+The controller repo configures everything else after the bootstrap, including:
 
-- Hostname, DNS resolvers and NTP (Physical and VMs only, Proxmox manages these for LXCs).
-- SSH daemon hardening (password auth, root login).
-- Package upgrades.
+- base packages, timezone and locale (its `base` role);
+- the firewall's default policy, turning UFW on, and service rules (planned firewall role);
+- NTP, automatic security updates, MOTD, shell prompt;
+- SSH daemon hardening (password auth, root login), and package upgrades.
 
-## Repo visibility: private or public
+## Public repo
 
-The repo contains no secrets. The controller public key is public by nature, and everything else is configuration. The one thing it does reveal is internal network layout (`ssh_allowed_cidrs`, `controller_from`). Either visibility works; the choice changes the prerequisites and the run command.
+This repo is public, and hosts pull it over HTTPS with no credentials. It contains no secrets: the controller
+public key is public by nature, and everything else is configuration. The one thing it does reveal is internal
+network layout (`ssh_allowed_cidrs`, `controller_from`), which is accepted.
 
-|                | Private repo                                             | Public repo                               |
-|----------------|----------------------------------------------------------|-------------------------------------------|
-| Transport      | SSH with a read-only deploy key                          | HTTPS, no credentials                     |
-| Target setup   | Deploy key from 1Password plus `/root/.ssh/config` entry | None beyond `git` and `ansible-core`      |
-| Exposes        | Nothing                                                  | Network layout in `vars/main.yml`         |
-| Integrity      | Branch protection, signed commits                        | Branch protection, signed commits (same)  |
-
-Repo integrity matters equally in both cases. See [Security model](#security-model).
+Being public controls who can read, not who can write. Repo integrity is what matters, all the more because
+hosts pull it every hour. See [Security model](#security-model).
 
 ## Prerequisites (target host)
-
-### Both variants
-
-Install packages:
 
 ```bash
 sudo apt update && sudo apt install git ansible-core
 ```
 
-### Private repo only
-
-1. Copy the repo deploy key `git-ansible-bootstrap` from 1Password to `/root/.ssh/git-ansible-bootstrap`, then set its mode:
-
-    ```bash
-    sudo chmod 0600 /root/.ssh/git-ansible-bootstrap
-    ```
-
-2. ansible-pull runs as root, so append this to `/root/.ssh/config`:
-
-    ```ini
-    Host git-ansible-bootstrap
-      HostName github.com
-      User git
-      IdentityFile ~/.ssh/git-ansible-bootstrap
-      IdentitiesOnly yes
-    ```
-
-### Public repo only
-
-Nothing further. The host needs outbound HTTPS to `github.com`, which the bootstrap does not restrict (UFW default outbound policy is allow).
+The host also needs outbound HTTPS to `github.com`.
 
 ## Configure
 
-All variables live in `vars/main.yml`. Review them before the first run. In particular, confirm `ssh_allowed_cidrs` covers the network you are connecting from, or you will lock yourself out.
+All variables live in `vars/main.yml`. Review them before the first run. In particular, confirm
+`ssh_allowed_cidrs` covers the network you're connecting from, or you'll lock yourself out once UFW is on.
 
-|Variable|Purpose|
-|---|---|
-|`ansible_svc_user`|Service account the controller connects as|
-|`ansible_svc_home`|Home directory of the service account|
-|`ansible_svc_shell`|Login shell of the service account|
-|`controller_pubkey`|Controller's SSH public key (full line: type, key, comment)|
-|`controller_from`|Optional source IP restriction for the key (`from=` option). Empty means none|
-|`controller_key_options`|Options prepended to the key in `authorized_keys`. Default `restrict`. Empty means none|
-|`grant_sudo`|Whether the service account gets passwordless sudo|
-|`sudoers_dropin_path`|Path of the sudoers drop-in|
-|`base_packages`|Packages installed if missing|
-|`ssh_service_name`|SSH service unit name (`ssh` on Debian/Ubuntu)|
-|`ssh_port`|Port the UFW SSH rules apply to|
-|`ssh_allowed_cidrs`|Networks allowed to reach SSH. Authoritative: other allow/limit rules for `ssh_port` are removed|
-|`system_timezone`|IANA timezone name, e.g. `Pacific/Auckland`|
-|`system_locale`|Default locale, e.g. `en_NZ.UTF-8`|
+| Variable | Purpose |
+| --- | --- |
+| `ansible_svc_user`, `ansible_svc_home`, `ansible_svc_shell` | The service account the controller connects as |
+| `controller_pubkeys` | The controller's SSH public keys, one full line each (type, key, comment). Normally one; two during a rotation |
+| `controller_from` | Source IP restriction for the key (`from=`). Comma-separated for more than one. Empty means none |
+| `controller_key_options` | Options prepended to the key. Default `restrict`. Empty means none |
+| `grant_sudo`, `sudoers_dropin_path` | Passwordless sudo for the service account, and where the drop-in goes |
+| `ssh_service_name` | SSH service unit name (`ssh` on Debian/Ubuntu) |
+| `ssh_port`, `ssh_allowed_cidrs` | Port and networks for the UFW SSH rules. Authoritative: other allow/limit rules for `ssh_port` are removed |
+| `bootstrap_packages` | Packages access and the pull need (plus `ufw` on non-PVE hosts) |
+| `bootstrap_schedule_enabled` | Hourly timer on (`true`) or off (`false`, the default) |
+| `bootstrap_schedule_oncalendar`, `bootstrap_schedule_random_delay` | When the timer fires (`hourly`, plus up to `15min`) |
+| `bootstrap_schedule_only_if_changed` | Only re-apply when there's a new commit (default `true`) |
+| `bootstrap_repo_url`, `bootstrap_repo_branch`, `bootstrap_checkout_dir` | What the timer pulls, and where it keeps the checkout |
 
-`restrict` disables port forwarding, agent forwarding, X11 forwarding and pty allocation for the key. Ansible needs none of these (it runs modules over the SSH exec channel and `become` uses passwordless sudo). Clear `controller_key_options` if you need an interactive shell as the service account.
+`restrict` disables port forwarding, agent forwarding, X11 forwarding and pty allocation for the key. Ansible
+needs none of these: it runs modules over the SSH exec channel, and `become` uses passwordless sudo. Clear
+`controller_key_options` if you need an interactive shell as the service account.
 
-## Run
-
-ansible-pull runs `local.yml` by default. Pick the command that matches the repo visibility.
-
-### Private repo (SSH, deploy key)
+## First run (by hand)
 
 ```bash
-sudo ansible-pull \
-    -U git@git-ansible-bootstrap:colwilliamsnz/ansible-bootstrap.git \
+sudo LC_ALL=C.UTF-8 ansible-pull \
+    -U https://github.com/colwilliamsnz/homelab-ansible-bootstrap.git \
     -C main \
+    -d /var/lib/ansible-pull/bootstrap \
     -i localhost, \
-    --accept-host-key \
-    --purge
+    --clean \
+    local.yml
 ```
 
-`--accept-host-key` adds GitHub's SSH host key to root's `known_hosts` on first contact. Without it the clone stops at the host key prompt.
+- `LC_ALL=C.UTF-8`: ansible-core refuses to run without a UTF-8 locale, and a fresh minimal image may not have
+  one set. `C.UTF-8` is built into Debian and Ubuntu. The timer sets the same thing for its runs.
+- `-d /var/lib/ansible-pull/bootstrap`: the same checkout the timer uses, so the timer's first run sees no new
+  commit and doesn't run again straight away.
+- HTTPS verifies GitHub through the system CA bundle (`ca-certificates`), so no `--accept-host-key` or
+  `known_hosts` entry is needed.
+- The play is safe to re-run. A re-run reports no changes if nothing has drifted.
+- Add `--check` for a dry run. It skips the `ufw` commands, so it doesn't preview firewall rule changes. On a
+  host that doesn't have the timer yet, the timer step's error is ignored in a dry run.
+- To test a branch, use `-C <branch>`.
 
-### Public repo (HTTPS)
+## After the first run: trust the host key on the controller
 
-```bash
-sudo ansible-pull \
-    -U https://github.com/colwilliamsnz/ansible-bootstrap.git \
-    -C main \
-    -i localhost, \
-    --purge
-```
-
-No `--accept-host-key`: HTTPS verifies GitHub through the system CA bundle (`ca-certificates`), not `known_hosts`.
-
-### Common options
-
-`--purge` deletes the checkout (`/root/.ansible/pull/<hostname>`) after the run. The bootstrap is one-shot, so nothing needs it afterwards.
-
-The playbook is safe to re-run. A re-run reapplies the same config and reports no changes if nothing has drifted.
-
-Add `--check` for a dry run. It skips the `ufw` and `locale-gen` commands, so it does not preview firewall or locale changes.
-
-## After the run: trust the host key on the controller
-
-Add the target's host key to the controller's `known_hosts` so later automated SSH connections can verify it.
+Add the target's host key to the controller's `known_hosts`, so later automated SSH connections can verify it.
+Playbooks on the controller run as `svc_ansible`, so the key goes in that account's `known_hosts`. Run these on
+the controller, from the root of the [host-inf-cfgm-01](https://github.com/colwilliamsnz/host-inf-cfgm-01) repo,
+after adding the host to `inventory/hosts.yml` there.
 
 Single host:
 
 ```bash
-ssh-keyscan -H -t ed25519 target.example.com >> ~/.ssh/known_hosts
+ssh-keyscan -H -t ed25519 target.wattle.nz | sudo -u svc_ansible tee -a /home/svc_ansible/.ssh/known_hosts
 ```
 
 Every host in the inventory:
 
 ```bash
-ansible all -i inventory.ini --list-hosts | tail -n +2 | xargs -I{} ssh-keyscan -H -t ed25519 {} >> ~/.ssh/known_hosts
+sudo -u svc_ansible sh -c 'ansible all --list-hosts' | tail -n +2 | xargs -n1 ssh-keyscan -H -t ed25519 2>/dev/null \
+  | sudo -u svc_ansible tee -a /home/svc_ansible/.ssh/known_hosts >/dev/null
 ```
 
-`ssh-keyscan` trusts whatever key answers. Compare the fingerprint against the target's console output (`ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub`) before relying on it.
+`ssh-keyscan` trusts whatever key answers. Compare the fingerprint against the target's console
+(`ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub`) before relying on it.
+
+Then apply the controller's baseline:
+
+```bash
+sudo -u svc_ansible sh -c 'ansible-playbook site.yml --limit <host>'
+```
+
+## Hourly pull
+
+The play always installs two systemd units:
+
+- **`ansible-bootstrap-pull.service`:** a oneshot, so runs never overlap. It runs:
+  ```
+  ansible-pull -U <bootstrap_repo_url> -C main -d /var/lib/ansible-pull/bootstrap -i localhost, --clean --only-if-changed local.yml
+  ```
+  with `LC_ALL=C.UTF-8` and `HOME=/root`. `--clean` discards any local edits to the checkout.
+- **`ansible-bootstrap-pull.timer`:** `OnCalendar=hourly`, `RandomizedDelaySec=15min` (so hosts don't all hit
+  GitHub at once), and `Persistent=true` (a run missed while the host was off happens at the next boot).
+
+**`--only-if-changed`:** a run only applies the play when there's a new commit. Changes made on the host itself
+(e.g. someone editing `authorized_keys`) aren't corrected until the next commit. To make every host re-apply,
+push any commit: `git commit --allow-empty -m "Re-apply bootstrap"` works. To re-apply on one host straight
+away, run the [first-run command](#first-run-by-hand) again.
+
+**Turning it on (rollout):** set `bootstrap_schedule_enabled: true` and merge, then run the bootstrap by hand
+once on each host. A host whose timer is off never pulls, so it can't pick up the change by itself. Planned
+order: a test host, then LXCs, VMs and Proxmox VE nodes.
+
+**Kill switch:** set `bootstrap_schedule_enabled: false` and push. That's a new commit, so every host with a
+running timer pulls it and turns its own timer off.
+
+**Checking a host:**
+
+```bash
+systemctl list-timers ansible-bootstrap-pull.timer   # next and last run
+journalctl -u ansible-bootstrap-pull -n 50           # output of recent runs
+systemctl is-failed ansible-bootstrap-pull.service   # "failed" if the last run failed
+```
+
+A failed run leaves the service failed, so systemd reports the host as `degraded`. The controller's MOTD shows
+that at login, with the unit name.
+
+## Changing controller access
+
+Do these as an overlap, so the controller never loses access while hosts catch up.
+
+**Controller IP change:**
+1. Add the new IP alongside the old one: `controller_from: "10.10.20.42,<new>"`. Make sure its network is in
+   `ssh_allowed_cidrs`. Merge.
+2. Wait about 75 minutes (hourly, plus up to 15 minutes of random delay), and confirm the controller still reaches
+   every host.
+3. Move the controller.
+4. Remove the old IP and merge.
+
+**Controller key change (rotation):**
+1. Add the new public key to `controller_pubkeys`, keeping the old one. Merge.
+2. Wait about 75 minutes, and confirm every host has both keys
+   (`sudo -u svc_ansible sh -c 'ansible all -m ansible.builtin.command -a "wc -l .ssh/authorized_keys"'` should show 2).
+3. Point the controller at the new private key (`private_key_file` in host-inf-cfgm-01's `ansible.cfg`), and confirm a run works.
+4. Remove the old key from `controller_pubkeys` and merge.
+
+**Until the controller's `base` role stops managing access** (plan step 4 in host-inf-cfgm-01), it still writes
+`authorized_keys` and sudoers from that repo's `inventory/group_vars/all.yml`. Change the same values there in the
+same change, or the two repos undo each other.
+
+## Proxmox VE nodes
+
+PVE nodes are detected by `/etc/pve` and get access only: the service account, key, sudo, sshd and the hourly pull.
+They get no `ufw` package and no firewall rules. Default-deny UFW would block the web UI (8006), corosync,
+migration and SNMP. PVE has its own firewall for that.
 
 ## Sudo access
 
-The controller connects as `svc_ansible`, an unprivileged account. Almost everything a playbook does (install packages, write to `/etc`, manage services) needs root, which Ansible gets with `become: true`. On Debian/Ubuntu `become` runs `sudo` under the hood, and there is no one at the keyboard to type a password. The sudoers drop-in is what makes that work.
+The controller connects as `svc_ansible`, an unprivileged account. Almost everything a playbook does (install
+packages, write to `/etc`, manage services) needs root, which Ansible gets with `become: true`. On Debian/Ubuntu,
+`become` runs `sudo` under the hood, and there's no one at the keyboard to type a password. The sudoers drop-in is
+what makes that work.
 
 The play writes one line to `/etc/sudoers.d/99-ansible`:
 
@@ -157,42 +207,55 @@ The play writes one line to `/etc/sudoers.d/99-ansible`:
 svc_ansible ALL=(ALL) NOPASSWD: ALL
 ```
 
-Read left to right: on any host, `svc_ansible` may run any command as any user without a password.
+Read left to right: on any host, `svc_ansible` may run any command, as any user, without a password.
 
 Why a drop-in rather than editing `/etc/sudoers`:
 
 - `/etc/sudoers` is owned by the distro package. Editing it invites merge conflicts on upgrade and makes the change hard to find later.
 - A drop-in is a single file with one owner and one purpose. Removing it (or setting `grant_sudo: false`) removes the grant cleanly.
-- The `99-` prefix sorts it after the distro's own drop-ins, so it is applied last.
+- The `99-` prefix sorts it after the distro's own drop-ins, so it's applied last.
 
-Why it is safe to write with Ansible:
+Why it's safe to write with Ansible:
 
-- The file is passed through `visudo -cf` before it is put in place. A syntax error in sudoers can lock everyone out of `sudo` on the host. `visudo -cf` rejects the file and the task fails instead.
+- The file is passed through `visudo -cf` before it's put in place. A syntax error in sudoers can lock everyone out of `sudo` on the host; `visudo -cf` rejects the file and the task fails instead.
 - Mode is `0440`, owner `root:root`. `sudo` ignores drop-ins with looser permissions.
 
 Why `NOPASSWD: ALL` and not a narrower command list:
 
-- Ansible modules run as arbitrary Python scripts in temp paths, so a command allow-list cannot be expressed meaningfully. Any attempt to restrict it would either break Ansible or be trivially bypassed.
-- The real boundary is who can authenticate as `svc_ansible`. That is controlled by the `authorized_keys` file (single key, `restrict`, `from=`) and UFW. See [Security model](#security-model).
+- Ansible modules run as arbitrary Python scripts in temp paths, so a command allow-list can't be expressed meaningfully. Any attempt to restrict it would either break Ansible or be trivially bypassed.
+- The real boundary is who can authenticate as `svc_ansible`. That's controlled by the `authorized_keys` file (only the listed keys, `restrict`, `from=`) and the firewall. See [Security model](#security-model).
 
-Set `grant_sudo: false` if the controller will only ever run tasks that do not need root on this host. The play then removes the drop-in if it exists.
+`grant_sudo: false` removes the drop-in. Don't use it on hosts the controller manages: the controller's playbooks need `become`.
 
 ## Firewall behaviour
 
-- Allow rules are added before UFW is enabled, so SSH from permitted networks is never interrupted.
-- The managed rule form is `allow from <cidr> to any port <ssh_port> proto tcp`. Networks removed from `ssh_allowed_cidrs` have their rule deleted.
-- Any other `allow` or `limit` rule that references `ssh_port` is deleted. This covers `allow 22/tcp`, `limit 22/tcp`, `allow OpenSSH`, `allow ssh`, `allow from any to any port 22`, and interface-scoped forms such as `allow in on eth0 to any port 22`. Rules for other ports are left alone.
-- Default policies (`DEFAULT_INPUT_POLICY="DROP"`, `DEFAULT_OUTPUT_POLICY="ACCEPT"`) are the UFW defaults. The play enforces them in `/etc/default/ufw` in case they have been changed.
-- **Lockout risk:** if you run the bootstrap over SSH from a network not in `ssh_allowed_cidrs`, your next connection will be refused. The controller's IP (and `controller_from`, if set) must fall inside a permitted network.
+This play owns **only the UFW rules for SSH** (`ssh_port`), on non-PVE hosts. The firewall's default policy,
+turning UFW on, and rules for other services belong to the controller repo (a planned firewall role).
+
+- **It doesn't turn UFW on.** UFW stores rules even while it's off. When the controller's firewall role turns
+  UFW on with default-deny, SSH from `ssh_allowed_cidrs` is already allowed. Hosts where UFW is already on keep it on.
+- **Until that role exists, a newly bootstrapped host has no active firewall.** That's accepted.
+- **Managed rules** take the form `allow from <cidr> to any port <ssh_port> proto tcp`, with the comment
+  `bootstrap-ssh`. New rules are added before old ones are removed, so SSH from a permitted network is never
+  cut off. Networks removed from `ssh_allowed_cidrs` have their rule deleted.
+- **Any other `allow` or `limit` rule for `ssh_port` is deleted.** This covers `allow 22/tcp`, `limit 22/tcp`,
+  `allow OpenSSH`, `allow ssh`, `allow from any to any port 22`, and interface-scoped forms such as
+  `allow in on eth0 to any port 22`. Rules for other ports are left alone. Extra SSH sources (e.g. an admin
+  network) go in `ssh_allowed_cidrs`, not in the firewall role.
+- **Lockout risk:** once UFW is on, SSH from a network not in `ssh_allowed_cidrs` is refused. The controller's IP
+  (and `controller_from`) must fall inside a permitted network.
 - Rules are IPv4 only when the CIDRs are IPv4. Inbound IPv6 SSH is then denied by the default policy.
 
 ## Security model
 
-The controller public key is not a secret. Repo integrity is what matters. Anyone who can push to the pulled branch decides which key is authorised, and so gets root on every host that pulls. This is true whether the repo is private or public: visibility controls who can read, not who can write.
+The controller public key isn't a secret. Repo integrity is what matters. Anyone who can push to `main` decides
+which key is authorised, and so gets root on every host that pulls. **With the hourly timer, that's within the hour.**
+The repo being public doesn't change that: visibility controls who can read, not who can write.
 
-- Protect the branch and restrict push access.
-- Sign commits, and pull with `--verify-commit` once a signing key is in place on targets.
+- Protect `main`, and restrict push access.
+- Sign commits, and pull with `--verify-commit` once a signing key is in place on targets (planned; needed before
+  the timer goes on everywhere).
 - Set `controller_from` to the controller's IP.
-- Keep `controller_key_options` at `restrict` unless there is a reason not to.
-
-A private repo additionally hides the network layout in `vars/main.yml` from the public. A public repo removes the deploy key handling from every new host. Pick based on how much the CIDRs and controller IP matter to you; the play itself is the same either way.
+- Keep `controller_key_options` at `restrict` unless there's a reason not to.
+- The [kill switch](#hourly-pull) stops every running timer on the next pull, but it also arrives as a commit, so
+  it relies on the same repo integrity.

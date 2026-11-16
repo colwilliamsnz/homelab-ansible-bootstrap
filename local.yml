@@ -1,4 +1,12 @@
 ---
+# Access-only bootstrap. Gets a host to the point where the Ansible controller
+# can connect and manage it, and keeps it there: the svc_ansible account, its
+# authorized_keys and sudo, sshd, and (not on Proxmox VE) the UFW rules that
+# let SSH in. Everything else (base packages, timezone, locale, firewall policy)
+# is configured from the controller repo, host-inf-cfgm-01.
+#
+# Runs by hand once, then hourly from the systemd timer this play installs
+# (when bootstrap_schedule_enabled is true). It must stay safe to re-run.
 
 - name: Wattle Labs Ansible-Pull Bootstrap
   hosts: localhost
@@ -15,107 +23,46 @@
           - ansible_facts['os_family'] == 'Debian'
         fail_msg: "This bootstrap supports Debian/Ubuntu only (found {{ ansible_facts['os_family'] }})."
 
-    - name: Fail fast if the controller public key is missing or malformed
+    # Lockout guard: authorized_keys is rewritten from this list, so it must be
+    # non-empty and every entry must look like a real public key line.
+    - name: Fail fast if the controller public keys are missing or malformed
       ansible.builtin.assert:
         that:
-          - controller_pubkey is match('^(ssh-|ecdsa-|sk-)')
-          - controller_pubkey.split() | length >= 2
-          - "'...' not in controller_pubkey"
-        fail_msg: "controller_pubkey in vars/main.yml is unset or still the placeholder."
+          - controller_pubkeys | length > 0
+          - controller_pubkeys | reject('match', '^(ssh-|ecdsa-|sk-)\S+\s+\S+') | list | length == 0
+          - controller_pubkeys | select('search', '\.\.\.') | list | length == 0
+        fail_msg: "controller_pubkeys in vars/main.yml is empty, malformed, or still a placeholder."
+
+    # PVE nodes get access only: no UFW at all. Default-deny would block the web
+    # UI (8006), corosync, migration and SNMP; PVE has its own firewall.
+    - name: Check for Proxmox VE
+      ansible.builtin.stat:
+        path: /etc/pve
+      register: bootstrap_pve_dir
+
+    - name: Record whether this host is a Proxmox VE node
+      ansible.builtin.set_fact:
+        bootstrap_is_pve: "{{ bootstrap_pve_dir.stat.exists }}"
 
     - name: Fail fast if no SSH source networks are defined (would lock out SSH)
       ansible.builtin.assert:
         that:
           - ssh_allowed_cidrs | length > 0
         fail_msg: "ssh_allowed_cidrs in vars/main.yml must contain at least one network."
-
-  handlers:
-
-    - name: Reload ufw
-      ansible.builtin.command: ufw reload
-      changed_when: true
+      when: not bootstrap_is_pve
 
   tasks:
 
     # ---------- Packages ----------
+    # Only what access and the hourly pull depend on. Present, never latest:
+    # patching is the controller's job.
 
-    - name: Install bootstrap prerequisites
+    - name: Install access and ansible-pull prerequisites
       ansible.builtin.apt:
-        name:
-          - tzdata
-          - locales
-          - ufw
+        name: "{{ bootstrap_packages + ([] if bootstrap_is_pve else ['ufw']) }}"
         state: present
         update_cache: true
         cache_valid_time: 3600
-
-    - name: Install base packages
-      ansible.builtin.apt:
-        name: "{{ base_packages }}"
-        state: present
-
-    # ---------- Timezone ----------
-
-    - name: Check the timezone exists in zoneinfo
-      ansible.builtin.stat:
-        path: "/usr/share/zoneinfo/{{ system_timezone }}"
-      register: tz_zoneinfo
-
-    - name: Fail if the timezone name is invalid
-      ansible.builtin.assert:
-        that:
-          - tz_zoneinfo.stat.exists
-        fail_msg: "system_timezone '{{ system_timezone }}' not found in /usr/share/zoneinfo."
-
-    - name: Point /etc/localtime at the timezone
-      ansible.builtin.file:
-        src: "/usr/share/zoneinfo/{{ system_timezone }}"
-        dest: /etc/localtime
-        state: link
-        force: true
-
-    - name: Keep /etc/timezone in sync
-      ansible.builtin.copy:
-        content: "{{ system_timezone }}\n"
-        dest: /etc/timezone
-        owner: root
-        group: root
-        mode: "0644"
-
-    # ---------- Locale ----------
-
-    - name: Enable the locale in /etc/locale.gen
-      ansible.builtin.lineinfile:
-        path: /etc/locale.gen
-        regexp: "^#?\\s*{{ system_locale | regex_escape }}\\s"
-        line: "{{ system_locale }} {{ system_locale.split('.')[1] }}"
-        create: true
-        owner: root
-        group: root
-        mode: "0644"
-
-    - name: List generated locales
-      ansible.builtin.command: locale -a
-      register: locales_generated
-      changed_when: false
-      check_mode: false
-
-    - name: Generate the locale
-      ansible.builtin.command: locale-gen
-      changed_when: true
-      when: >-
-        (system_locale | lower | replace('-', ''))
-        not in (locales_generated.stdout_lines | map('lower') | list)
-
-    - name: Set the system default locale
-      ansible.builtin.lineinfile:
-        path: /etc/default/locale
-        regexp: "^LANG="
-        line: "LANG={{ system_locale }}"
-        create: true
-        owner: root
-        group: root
-        mode: "0644"
 
     # ---------- Service account ----------
 
@@ -136,18 +83,21 @@
         group: "{{ ansible_svc_user }}"
         mode: "0700"
 
-    - name: Build the authorized_keys options string
+    - name: Build the authorized_keys options prefix
       ansible.builtin.set_fact:
-        controller_key_opts: >-
+        controller_key_prefix: >-
           {{ ([controller_key_options]
               + (['from="' ~ controller_from ~ '"'] if controller_from | length > 0 else []))
              | select | join(',') }}
 
-    # The file is authoritative: only the controller key is present. Any other
-    # key for this account is removed.
-    - name: Install the controller public key (authoritative)
+    # The file is authoritative: only the controller keys are present, one line
+    # each, every line with the same options. Any other key is removed. The
+    # output is byte-identical to the controller's base role for the same values.
+    - name: Install the controller public keys (authoritative)
+      vars:
+        controller_key_line_prefix: "{{ (controller_key_prefix ~ ' ') if controller_key_prefix | length > 0 else '' }}"
       ansible.builtin.copy:
-        content: "{{ (controller_key_opts ~ ' ') if controller_key_opts | length > 0 else '' }}{{ controller_pubkey }}\n"
+        content: "{{ controller_pubkeys | map('regex_replace', '^', controller_key_line_prefix) | join('\n') }}\n"
         dest: "{{ ansible_svc_home }}/.ssh/authorized_keys"
         owner: "{{ ansible_svc_user }}"
         group: "{{ ansible_svc_user }}"
@@ -169,22 +119,20 @@
         state: absent
       when: not (grant_sudo | bool)
 
-    # ---------- Firewall (UFW) ----------
-    # Order matters: SSH rules are reconciled before UFW is enabled, so SSH from
-    # ssh_allowed_cidrs is never cut off. Managed rules take the form
-    # "allow from <cidr> to any port <ssh_port> proto tcp".
+    # ---------- SSH firewall rules (UFW, not on PVE) ----------
+    # This play owns every UFW rule for ssh_port and nothing else. It does NOT
+    # turn UFW on or set default policies: that belongs to the controller's
+    # firewall role. Rules are stored while UFW is off and take effect when the
+    # role enables it, so SSH is already allowed by then. Where UFW is already
+    # on, it stays on. Managed rules take the form
+    # "allow from <cidr> to any port <ssh_port> proto tcp" (comment 'bootstrap-ssh').
 
     - name: Read current UFW rules
       ansible.builtin.command: ufw show added
       register: ufw_added
       changed_when: false
       check_mode: false
-
-    - name: Read UFW status
-      ansible.builtin.command: ufw status
-      register: ufw_status
-      changed_when: false
-      check_mode: false
+      when: not bootstrap_is_pve
 
     - name: Work out desired and existing managed SSH rules
       ansible.builtin.set_fact:
@@ -198,11 +146,22 @@
              | map('regex_replace', '\s+comment\s.*$', '')
              | select('match', '^ufw allow from \S+ to any port ' ~ ssh_port ~ ' proto tcp$')
              | list }}
+      when: not bootstrap_is_pve
+
+    # Add before removing, so SSH from a permitted network is never cut off,
+    # even with UFW on.
+    # Loops are expanded before `when` is checked, hence the default([]) on PVE.
+    - name: Allow SSH from each permitted network
+      ansible.builtin.command: "{{ item }} comment 'bootstrap-ssh'"
+      loop: "{{ ufw_ssh_desired | default([]) | difference(ufw_ssh_managed | default([])) }}"
+      changed_when: true
+      when: not bootstrap_is_pve
 
     - name: Remove SSH rules for networks no longer in ssh_allowed_cidrs
       ansible.builtin.command: "ufw delete {{ item | regex_replace('^ufw ', '') }}"
-      loop: "{{ ufw_ssh_managed | difference(ufw_ssh_desired) }}"
+      loop: "{{ ufw_ssh_managed | default([]) | difference(ufw_ssh_desired | default([])) }}"
       changed_when: true
+      when: not bootstrap_is_pve
 
     # Any other allow or limit rule that mentions ssh_port (e.g. "allow 22/tcp",
     # "limit 22/tcp", "allow OpenSSH", "allow from any to any port 22",
@@ -210,7 +169,7 @@
     - name: Remove other SSH allow/limit rules
       ansible.builtin.command: "ufw delete {{ item }}"
       loop: >-
-        {{ ufw_added.stdout_lines
+        {{ ufw_added.stdout_lines | default([])
            | select('match', '^ufw (allow|limit)(\s|$)')
            | reject('match', '^ufw allow from \S+ to any port ' ~ ssh_port ~ ' proto tcp(\s|$)')
            | select('search', '(^|\s)(' ~ ssh_port ~ '(/tcp)?|OpenSSH|ssh)(\s|$)')
@@ -218,30 +177,7 @@
            | map('regex_replace', '\s+comment\s.*$', '')
            | unique }}
       changed_when: true
-
-    - name: Allow SSH from each permitted network
-      ansible.builtin.command: "{{ item }} comment 'bootstrap-ssh'"
-      loop: "{{ ufw_ssh_desired | difference(ufw_ssh_managed) }}"
-      changed_when: true
-
-    - name: Default deny inbound
-      ansible.builtin.lineinfile:
-        path: /etc/default/ufw
-        regexp: "^DEFAULT_INPUT_POLICY="
-        line: 'DEFAULT_INPUT_POLICY="DROP"'
-      notify: Reload ufw
-
-    - name: Default allow outbound
-      ansible.builtin.lineinfile:
-        path: /etc/default/ufw
-        regexp: "^DEFAULT_OUTPUT_POLICY="
-        line: 'DEFAULT_OUTPUT_POLICY="ACCEPT"'
-      notify: Reload ufw
-
-    - name: Enable UFW
-      ansible.builtin.command: ufw --force enable
-      when: "'Status: inactive' in ufw_status.stdout"
-      changed_when: true
+      when: not bootstrap_is_pve
 
     # ---------- Services ----------
 
@@ -250,3 +186,67 @@
         name: "{{ ssh_service_name }}"
         state: started
         enabled: true
+
+    # ---------- Hourly pull (systemd timer) ----------
+    # Installed on every run; only enabled when bootstrap_schedule_enabled is true.
+    # LC_ALL=C.UTF-8: ansible-core needs a UTF-8 locale, and C.UTF-8 is built in,
+    # so the pull never depends on the system locale (set by the controller).
+
+    - name: Ensure the ansible-pull checkout parent exists
+      ansible.builtin.file:
+        path: "{{ bootstrap_checkout_dir | dirname }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0700"
+
+    - name: Install the bootstrap pull service
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/ansible-bootstrap-pull.service
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          # Managed by homelab-ansible-bootstrap (local.yml). Do not edit on the host.
+          [Unit]
+          Description=Ansible bootstrap pull (controller access)
+          Wants=network-online.target
+          After=network-online.target
+
+          [Service]
+          Type=oneshot
+          Environment=LC_ALL=C.UTF-8
+          Environment=HOME=/root
+          ExecStart=/usr/bin/ansible-pull -U {{ bootstrap_repo_url }} -C {{ bootstrap_repo_branch }} -d {{ bootstrap_checkout_dir }} -i localhost, --clean{{ ' --only-if-changed' if bootstrap_schedule_only_if_changed | bool else '' }} local.yml
+          TimeoutStartSec=30min
+      register: bootstrap_service_unit
+
+    - name: Install the bootstrap pull timer
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/ansible-bootstrap-pull.timer
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          # Managed by homelab-ansible-bootstrap (local.yml). Do not edit on the host.
+          [Unit]
+          Description=Hourly Ansible bootstrap pull (controller access)
+
+          [Timer]
+          OnCalendar={{ bootstrap_schedule_oncalendar }}
+          RandomizedDelaySec={{ bootstrap_schedule_random_delay }}
+          Persistent=true
+
+          [Install]
+          WantedBy=timers.target
+      register: bootstrap_timer_unit
+
+    # In --check on a fresh host the unit files aren't written, so systemd can't
+    # find the timer; don't fail the dry run on that.
+    - name: Enable or disable the hourly pull timer
+      ansible.builtin.systemd_service:
+        name: ansible-bootstrap-pull.timer
+        enabled: "{{ bootstrap_schedule_enabled | bool }}"
+        state: "{{ 'started' if bootstrap_schedule_enabled | bool else 'stopped' }}"
+        daemon_reload: "{{ bootstrap_service_unit.changed or bootstrap_timer_unit.changed }}"
+      ignore_errors: "{{ ansible_check_mode }}"

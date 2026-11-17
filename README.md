@@ -47,6 +47,13 @@ network layout (`ssh_allowed_cidrs`, `controller_from`), which is accepted.
 Being public controls who can read, not who can write. Repo integrity is what matters, all the more because
 hosts pull it every hour. See [Security model](#security-model).
 
+## Why a separate repo
+
+The bootstrap is kept apart from the controller repo on purpose:
+
+- ansible-pull clones the whole repo onto every target. Merged, every host would get the controller's inventory and roles.
+- Push access to this repo means root on every host that pulls it (see [Security model](#security-model)). A small repo with one purpose is easier to lock down.
+
 ## Prerequisites (target host)
 
 ```bash
@@ -244,6 +251,7 @@ turning UFW on, and rules for other services belong to the controller repo (a pl
 - **It doesn't turn UFW on.** UFW stores rules even while it's off. When the controller's firewall role turns
   UFW on with default-deny, SSH from `ssh_allowed_cidrs` is already allowed. Hosts where UFW is already on keep it on.
 - **Until that role exists, a newly bootstrapped host has no active firewall.** That's accepted.
+- **The controller's firewall role uses UFW as well** (decided Nov 2026), not nftables or the Proxmox per-guest firewall: UFW is already on every bootstrapped host, and the tagged SSH rules here already work with it. The role never runs `ufw reset` and only deletes rules it tagged itself, so the role and the hourly pull don't undo each other.
 - **Managed rules** take the form `allow from <cidr> to any port <ssh_port> proto tcp`, with the comment
   `bootstrap-ssh`. New rules are added before old ones are removed, so SSH from a permitted network is never
   cut off. Networks removed from `ssh_allowed_cidrs` have their rule deleted.
@@ -268,3 +276,45 @@ The repo being public doesn't change that: visibility controls who can read, not
 - Keep `controller_key_options` at `restrict` unless there's a reason not to.
 - The [kill switch](#hourly-pull) stops every running timer on the next pull, but it also arrives as a commit, so
   it relies on the same repo integrity.
+
+## Working on this repo
+
+### Scope
+
+- Access only. Anything listed under [Out of scope](#out-of-scope) goes in the controller repo, not here.
+- No secrets. The repo stays public and pulled over HTTPS: no private-repo or deploy-key variant.
+- The play never turns UFW on, sets its defaults, or touches rules for ports other than `ssh_port`.
+- `bootstrap_schedule_only_if_changed` stays `false`, so every hourly run re-applies the play.
+
+### The play
+
+- It runs hourly on every host, so it must stay safe to re-run.
+- Asserts come before any change. Validate before writing (`visudo -cf`).
+- Anything that can lock out the controller needs a way to dry-run it with `--check`.
+- `ansible.builtin` modules only. A fresh host has only `ansible-core`, so no collections.
+- Loops are expanded before `when` is checked. Tasks skipped on PVE need `| default([])` on registered results in their loops.
+- The `authorized_keys` output must stay byte-identical to the controller's `base` role output for the same values.
+
+### Values shared with the controller repo
+
+Until plan step 4, both repos write `authorized_keys` and sudoers. Change these in both repos in the same session, following [Changing controller access](#changing-controller-access). Never replace an old value in a single commit.
+
+| `vars/main.yml` (here) | `inventory/group_vars/all.yml` (host-inf-cfgm-01) |
+| --- | --- |
+| `controller_pubkeys` | `base_ansible_pubkeys` |
+| `controller_from` | `base_ansible_from` |
+| `controller_key_options` | `base_ansible_key_options` |
+| `ansible_svc_user`, `ansible_svc_home`, `ansible_svc_shell` | `base_ansible_user`, `base_ansible_home`, `base_ansible_shell` |
+| `sudoers_dropin_path` | `base_sudoers_dropin_path` |
+
+`controller_from` must fall inside `ssh_allowed_cidrs`.
+
+### Testing and merging
+
+- Ansible isn't installed where this repo is edited, so nothing is run or linted locally.
+- Test from a branch, at the console of `lab-cfgm-01.wattle.nz`, with `--check` first and then without it. Test on a PVE node only after that.
+  ```bash
+  sudo LC_ALL=C.UTF-8 ansible-pull -U https://github.com/colwilliamsnz/homelab-ansible-bootstrap.git -C <branch> -i localhost, --check
+  ```
+- Flow: branch, commit, push the branch, test on `lab-cfgm-01`, `git merge --ff-only` into `main`, push, delete the branch.
+- Hosts pull `main`, so anything merged reaches every host within the hour.

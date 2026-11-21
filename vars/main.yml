@@ -45,9 +45,8 @@ bootstrap_packages:
 # the controller's firewall role does.
 ssh_port: 22
 ssh_allowed_cidrs:
-  - 10.10.2.0/24
   - 10.10.20.0/24
-  - 10.10.40.0/24
+  - 10.10.30.0/24
 
 # ---------- Hourly pull (systemd timer) ----------
 

@@ -1,4 +1,4 @@
-# 0002: Signed commits and verified pulls
+# 002: Signed commits and verified pulls
 
 - Status: Open, Colin investigating
 - Blocked by: none

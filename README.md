@@ -157,14 +157,7 @@ editing `authorized_keys` or deleting the SSH rule) are put back within the hour
 is small. Setting it to `true` adds `--only-if-changed`: runs then only apply the play when there's a new commit.
 To re-apply on one host straight away, run the [first-run command](#first-run-by-hand) again.
 
-**Until the controller's `base` role stops managing access** (plan step 4 in host-inf-cfgm-01), both repos write
-`authorized_keys` and sudoers. If their values differ, each run of one overwrites the other, now every hour.
-Keep them identical (see [Changing controller access](#changing-controller-access)).
-
-**Rollout:** the timer is on in this repo (`bootstrap_schedule_enabled: true`). A host only gets it when the
-bootstrap is run by hand there once, which installs and starts the timer. A host that has never run this version
-never pulls, so it can't pick up the timer by itself. Order: the test host (`lab-cfgm-01`), then LXCs, VMs and
-Proxmox VE nodes.
+**Rollout:** done (Nov 2026): the timer runs on every host. A new host gets it on its [first run by hand](#first-run-by-hand). A host that has never run the bootstrap never pulls, so it can't pick up the timer by itself.
 
 **Kill switch:** set `bootstrap_schedule_enabled: false` and push. On its next hourly run, every host with a running
 timer pulls the change and turns its own timer off.
@@ -198,11 +191,6 @@ Do these as an overlap, so the controller never loses access while hosts catch u
    (`sudo -u svc_ansible sh -c 'ansible all -m ansible.builtin.command -a "wc -l .ssh/authorized_keys"'` should show 2).
 3. Point the controller at the new private key (`private_key_file` in host-inf-cfgm-01's `ansible.cfg`), and confirm a run works.
 4. Remove the old key from `controller_pubkeys` and merge.
-
-**Until the controller's `base` role stops managing access** (plan step 4 in host-inf-cfgm-01), it still writes
-`authorized_keys` and sudoers from that repo's `inventory/group_vars/all.yml` (`base_ansible_from`,
-`base_ansible_pubkeys`). At each step above, change the same value there too and run `--tags base`. Otherwise the
-two repos undo each other every hour. host-inf-cfgm-01's `roles/base/README.md` has the same procedure from that side.
 
 ## Proxmox VE nodes
 
@@ -293,21 +281,6 @@ The repo being public doesn't change that: visibility controls who can read, not
 - Anything that can lock out the controller needs a way to dry-run it with `--check`.
 - `ansible.builtin` modules only. A fresh host has only `ansible-core`, so no collections.
 - Loops are expanded before `when` is checked. Tasks skipped on PVE need `| default([])` on registered results in their loops.
-- The `authorized_keys` output must stay byte-identical to the controller's `base` role output for the same values.
-
-### Values shared with the controller repo
-
-Until plan step 4, both repos write `authorized_keys` and sudoers. Change these in both repos in the same session, following [Changing controller access](#changing-controller-access). Never replace an old value in a single commit.
-
-| `vars/main.yml` (here) | `inventory/group_vars/all.yml` (host-inf-cfgm-01) |
-| --- | --- |
-| `controller_pubkeys` | `base_ansible_pubkeys` |
-| `controller_from` | `base_ansible_from` |
-| `controller_key_options` | `base_ansible_key_options` |
-| `ansible_svc_user`, `ansible_svc_home`, `ansible_svc_shell` | `base_ansible_user`, `base_ansible_home`, `base_ansible_shell` |
-| `sudoers_dropin_path` | `base_sudoers_dropin_path` |
-
-`controller_from` must fall inside `ssh_allowed_cidrs`.
 
 ### Testing and merging
 

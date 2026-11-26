@@ -159,20 +159,6 @@
       changed_when: true
       when: not bootstrap_is_pve
 
-    # Rules from before Nov 2026 carry the comment 'bootstrap-ssh'. Adding the
-    # same rule with a new comment updates it in place, so SSH is never
-    # removed. Remove this task once no host has the old comment.
-    - name: Relabel SSH rules from the old comment
-      ansible.builtin.command: "{{ item }} comment 'ansible:bootstrap-ssh'"
-      loop: >-
-        {{ ufw_added.stdout_lines | default([])
-           | select('search', "\scomment 'bootstrap-ssh'$")
-           | map('regex_replace', '\s+comment\s.*$', '')
-           | select('in', ufw_ssh_desired | default([]))
-           | list }}
-      changed_when: true
-      when: not bootstrap_is_pve
-
     - name: Remove SSH rules for networks no longer in ssh_allowed_cidrs
       ansible.builtin.command: "ufw delete {{ item | regex_replace('^ufw ', '') }}"
       loop: "{{ ufw_ssh_managed | default([]) | difference(ufw_ssh_desired | default([])) }}"

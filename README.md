@@ -240,7 +240,7 @@ This play owns **only the UFW rules for SSH** (`ssh_port`), on non-PVE hosts. Th
 - **A newly bootstrapped host has no active firewall until the role runs on it.** That's accepted.
 - **The controller's firewall role uses UFW as well** (decided Nov 2026), not nftables or the Proxmox per-guest firewall: UFW is already on every bootstrapped host, and the tagged SSH rules here already work with it. The role never runs `ufw reset` and deletes every rule except this play's and route rules, so the role and the hourly pull don't undo each other.
 - **Managed rules** take the form `allow from <cidr> to any port <ssh_port> proto tcp`, with the comment
-  `ansible:bootstrap-ssh` (`bootstrap-ssh` before Nov 2026; older rules are relabelled in place). New rules are added before old ones are removed, so SSH from a permitted network is never
+  `ansible:bootstrap-ssh`. New rules are added before old ones are removed, so SSH from a permitted network is never
   cut off. Networks removed from `ssh_allowed_cidrs` have their rule deleted.
 - **Any other `allow` or `limit` rule for `ssh_port` is deleted.** This covers `allow 22/tcp`, `limit 22/tcp`,
   `allow OpenSSH`, `allow ssh`, `allow from any to any port 22`, and interface-scoped forms such as

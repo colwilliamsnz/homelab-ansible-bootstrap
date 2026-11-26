@@ -125,7 +125,9 @@
     # firewall role. Rules are stored while UFW is off and take effect when the
     # role enables it, so SSH is already allowed by then. Where UFW is already
     # on, it stays on. Managed rules take the form
-    # "allow from <cidr> to any port <ssh_port> proto tcp" (comment 'bootstrap-ssh').
+    # "allow from <cidr> to any port <ssh_port> proto tcp" (comment
+    # 'ansible:bootstrap-ssh'). The firewall role deletes every other rule
+    # except route rules, so this comment is how it knows to leave these alone.
 
     - name: Read current UFW rules
       ansible.builtin.command: ufw show added
@@ -152,8 +154,22 @@
     # even with UFW on.
     # Loops are expanded before `when` is checked, hence the default([]) on PVE.
     - name: Allow SSH from each permitted network
-      ansible.builtin.command: "{{ item }} comment 'bootstrap-ssh'"
+      ansible.builtin.command: "{{ item }} comment 'ansible:bootstrap-ssh'"
       loop: "{{ ufw_ssh_desired | default([]) | difference(ufw_ssh_managed | default([])) }}"
+      changed_when: true
+      when: not bootstrap_is_pve
+
+    # Rules from before Nov 2026 carry the comment 'bootstrap-ssh'. Adding the
+    # same rule with a new comment updates it in place, so SSH is never
+    # removed. Remove this task once no host has the old comment.
+    - name: Relabel SSH rules from the old comment
+      ansible.builtin.command: "{{ item }} comment 'ansible:bootstrap-ssh'"
+      loop: >-
+        {{ ufw_added.stdout_lines | default([])
+           | select('search', "\scomment 'bootstrap-ssh'$")
+           | map('regex_replace', '\s+comment\s.*$', '')
+           | select('in', ufw_ssh_desired | default([]))
+           | list }}
       changed_when: true
       when: not bootstrap_is_pve
 

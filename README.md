@@ -34,7 +34,7 @@ fails on anything else.
 The controller repo configures everything else after the bootstrap, including:
 
 - base packages, timezone and locale (its `base` role);
-- the firewall's default policy, turning UFW on, and service rules (planned firewall role);
+- the firewall's default policy, turning UFW on, and service rules (its `firewall` role);
 - NTP, automatic security updates, MOTD, shell prompt;
 - SSH daemon hardening (password auth, root login), and package upgrades.
 
@@ -233,12 +233,11 @@ Why `NOPASSWD: ALL` and not a narrower command list:
 
 ## Firewall behaviour
 
-This play owns **only the UFW rules for SSH** (`ssh_port`), on non-PVE hosts. The firewall's default policy,
-turning UFW on, and rules for other services belong to the controller repo (a planned firewall role).
+This play owns **only the UFW rules for SSH** (`ssh_port`), on non-PVE hosts. The firewall's default policy, turning UFW on, and rules for other services belong to the controller repo's `firewall` role.
 
 - **It doesn't turn UFW on.** UFW stores rules even while it's off. When the controller's firewall role turns
   UFW on with default-deny, SSH from `ssh_allowed_cidrs` is already allowed. Hosts where UFW is already on keep it on.
-- **Until that role exists, a newly bootstrapped host has no active firewall.** That's accepted.
+- **A newly bootstrapped host has no active firewall until the role runs on it.** That's accepted.
 - **The controller's firewall role uses UFW as well** (decided Nov 2026), not nftables or the Proxmox per-guest firewall: UFW is already on every bootstrapped host, and the tagged SSH rules here already work with it. The role never runs `ufw reset` and deletes every rule except this play's and route rules, so the role and the hourly pull don't undo each other.
 - **Managed rules** take the form `allow from <cidr> to any port <ssh_port> proto tcp`, with the comment
   `ansible:bootstrap-ssh` (`bootstrap-ssh` before Nov 2026; older rules are relabelled in place). New rules are added before old ones are removed, so SSH from a permitted network is never
